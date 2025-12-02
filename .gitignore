@@ -1,0 +1,20 @@
+# Extracted Saleae capture data (original .sal files are tracked)
+extracted/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
