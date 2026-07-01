@@ -1,13 +1,12 @@
-# Tado Reverse Engineering
-This repo contains all the information gathered whilst attempting to reverse engineer the Tado smart heating control system.
-Head over to the [Tado Reverse Engineering Wiki](https://github.com/sdegeorgio/Tado_Hardware_Teardown/wiki) section of this repo for more details.
+# Tado Hardware And Software Teardown
+This repo contains all the information gathered whilst tearing down the Tado smart heating control system.
+Head over to the [Tado Hardware Teardown Wiki](https://github.com/sdegeorgio/Tado_Hardware_Teardown/wiki) section of this repo for more details.
 
 ## Introduction
-The Tado smart heating and hot water control system is a very good system however I was fed up with there being no solution to the poor coverage.  I tried placing the Internet gateway device in many different locations within my home but it would never connect to all devices at once.  There are two solutions I came up with:
-1. Improve the RF range, or
-2. Develop a repeater device
+The Tado smart heating and hot water control system is a very good system, however as others have found it struggled to cover the footprint of my home.  I tried placing the Internet gateway device in many different locations within my home but it would never connect to all devices at once.
+Head over to the wiki to discover my journey to understand why it performs in this way and how we can improve it.
 
 ## This repo
-This repository contains some of the files generated whilst carrying out the reverse engineering process.  See the wiki section for more information.
+This repository contains some logic captures and a Tado over the air (OTA) protocol dissector for WireShark.  See the wiki section for more information.
 
 
