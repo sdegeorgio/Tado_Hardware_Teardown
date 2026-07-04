@@ -66,13 +66,19 @@ static int hf_tado_seq       = -1;
 static int hf_tado_checksum  = -1;
 static int hf_tado_crc_status = -1;
 
-// SYNC / Multipurpose beacon body (CSL wake-up; exact IE mapping still open)
-static int hf_tado_sync_sequence = -1;
-static int hf_tado_sync_const    = -1;
-static int hf_tado_sync_target   = -1;
-static int hf_tado_sync_const1   = -1;
-static int hf_tado_sync_countdown = -1;
-static int hf_tado_sync_const2   = -1;
+// SYNC / Multipurpose beacon body (802.15.4-2015 CSL wake-up frame).
+//   25 <seq> <dst PAN> <dst addr> <Rendezvous Time IE> <RZ time> <Header Termination IE>
+static int hf_tado_mpfc_dst_pan  = -1;   // Destination PAN ID (0xABCD)
+static int hf_tado_mpfc_dst_addr = -1;   // Destination short address (device being woken)
+static int hf_tado_csl_rendezvous = -1;  // CSL Rendezvous Time (counts down to the poll)
+static int hf_tado_csl_phase   = -1;     // CSL Phase (Enhanced Ack CSL IE)
+static int hf_tado_csl_period  = -1;     // CSL Period (Enhanced Ack CSL IE; observed 3125)
+
+// Header Information Element descriptor (2 octets, LE): length[0-6] elem-id[7-14] type[15]
+static int hf_tado_ie_desc    = -1;
+static int hf_tado_ie_length  = -1;
+static int hf_tado_ie_elemid  = -1;
+static int hf_tado_ie_type    = -1;
 
 // Tado addressing fields. An address is <device id:3> <network const 31 07 [c5 1b 00]>,
 // or the 2-byte broadcast 0xffff. Frame order is Destination then Source (802.15.4).
@@ -99,6 +105,18 @@ static gint ett_tado_fcf = -1;
 static gint ett_tado_sec = -1;
 static gint ett_tado_addr_src = -1;
 static gint ett_tado_addr_dst = -1;
+static gint ett_tado_ie = -1;
+
+// IEEE 802.15.4-2015 Header IE element IDs observed on this link.
+#define IEEE802154_HIE_CSL         0x1a   // CSL IE (Phase + Period); in the Enhanced Ack
+#define IEEE802154_HIE_RENDEZVOUS  0x1d   // Rendezvous Time IE; in the SYNC wake-up frame
+#define IEEE802154_HIE_TERMINATION 0x7f
+static const value_string ieee802154_hie_elemid_vals[] = {
+    { IEEE802154_HIE_CSL,         "CSL IE" },
+    { IEEE802154_HIE_RENDEZVOUS,  "Rendezvous Time IE" },
+    { IEEE802154_HIE_TERMINATION, "Header Termination IE" },
+    { 0, NULL }
+};
 
 static const value_string ieee802154_ftype_vals[] = {
     { IEEE802154_FTYPE_BEACON,       "Beacon" },
@@ -275,7 +293,26 @@ static guint16 tado_crc16_cms(const guint8 *data, guint len, guint16 crc)
 // Frame handlers
 // ---------------------------------------------------------------------------
 
-// Multipurpose frame (Tado "SYNC" / CSL wake-up beacon). 1-octet MP Frame Control.
+// Add one 802.15.4 Header IE descriptor (2 octets, little-endian) as a subtree and
+// return its element ID. Used for the SYNC frame's Rendezvous Time and Termination IEs.
+static guint8 dissect_tado_header_ie(tvbuff_t *tvb, proto_tree *tree, guint offset)
+{
+    guint16 desc  = tvb_get_letohs(tvb, offset);
+    guint8 elemid = (desc >> 7) & 0xff;
+    proto_item *ie = proto_tree_add_item(tree, hf_tado_ie_desc, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+    proto_item_set_text(ie, "Header IE: %s (0x%02x)",
+        val_to_str_const(elemid, ieee802154_hie_elemid_vals, "Unknown"), elemid);
+    proto_tree *ie_tree = proto_item_add_subtree(ie, ett_tado_ie);
+    proto_tree_add_item(ie_tree, hf_tado_ie_length, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+    proto_tree_add_item(ie_tree, hf_tado_ie_elemid, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+    proto_tree_add_item(ie_tree, hf_tado_ie_type,   tvb, offset, 2, ENC_LITTLE_ENDIAN);
+    return elemid;
+}
+
+// Multipurpose frame (Tado "SYNC" / CSL wake-up beacon), IEEE 802.15.4-2015 §7.3.5.
+// Layout: MPFC(1) seq(1) DstPAN(2) DstAddr(2) [Rendezvous Time IE(2) RZ-time(2)]
+//         [Header Termination IE(2)] CRC(2). All fields decode as standard 802.15.4;
+// see Tado_Protocol.md §3.1.
 static void dissect_tado_multipurpose(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree *tado_tree, guint packet_length)
 {
@@ -289,30 +326,33 @@ static void dissect_tado_multipurpose(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree_add_item(mp_tree, hf_tado_mpfc_srcmode, tvb, 0, 1, ENC_NA);
     offset += 1;
 
-    col_set_str(pinfo->cinfo, COL_INFO, "SYNC beacon (Multipurpose)");
+    col_set_str(pinfo->cinfo, COL_INFO, "SYNC beacon (CSL wake-up)");
 
-    // CSL beacon body. Field boundaries are empirically stable; full CSL IE decoding
-    // is still open (see Tado_Protocol.md §3.1/§3.4).
-    proto_tree_add_item(tado_tree, hf_tado_sync_sequence, tvb, offset, 1, ENC_NA);
+    proto_tree_add_item(tado_tree, hf_tado_seq, tvb, offset, 1, ENC_NA);
     offset += 1;
-    proto_tree_add_item(tado_tree, hf_tado_sync_const, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+
+    // Destination PAN ID (0xABCD) then Destination short address (device being woken).
+    proto_tree_add_item(tado_tree, hf_tado_mpfc_dst_pan, tvb, offset, 2, ENC_LITTLE_ENDIAN);
     offset += 2;
 
-    guint16 sync_target = tvb_get_letohs(tvb, offset);
-    const char *target_name = tado_device_name_lookup(sync_target);
-    proto_tree_add_uint_format(tado_tree, hf_tado_sync_target, tvb, offset, 2,
-        sync_target, "Target Device: %s (0x%04x)",
-        (sync_target == 0xffff) ? "Broadcast" : (target_name ? target_name : "Unknown"),
-        sync_target);
-    col_append_fstr(pinfo->cinfo, COL_INFO, " -> 0x%04x", sync_target);
+    guint16 dst_addr = tvb_get_letohs(tvb, offset);
+    const char *dst_name = tado_device_name_lookup(dst_addr);
+    proto_tree_add_uint_format(tado_tree, hf_tado_mpfc_dst_addr, tvb, offset, 2,
+        dst_addr, "Destination Address: %s (0x%04x)",
+        (dst_addr == 0xffff) ? "Broadcast" : (dst_name ? dst_name : "Unknown"),
+        dst_addr);
+    col_append_fstr(pinfo->cinfo, COL_INFO, " -> 0x%04x", dst_addr);
     offset += 2;
 
-    if (packet_length - offset >= 8) {
-        proto_tree_add_item(tado_tree, hf_tado_sync_const1,    tvb, offset, 2, ENC_LITTLE_ENDIAN);
+    // Header IE #1: Rendezvous Time IE (element ID 0x1D), whose 2-octet value is the
+    // CSL time-to-frame countdown; then Header IE #2: Header Termination (element ID 0x7F).
+    if (packet_length >= offset + 2 + 2 + 2) {
+        dissect_tado_header_ie(tvb, tado_tree, offset);
         offset += 2;
-        proto_tree_add_item(tado_tree, hf_tado_sync_countdown, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+        guint16 rz = tvb_get_letohs(tvb, offset);
+        proto_tree_add_uint(tado_tree, hf_tado_csl_rendezvous, tvb, offset, 2, rz);
         offset += 2;
-        proto_tree_add_item(tado_tree, hf_tado_sync_const2,    tvb, offset, 2, ENC_LITTLE_ENDIAN);
+        dissect_tado_header_ie(tvb, tado_tree, offset);
         offset += 2;
     }
 }
@@ -382,8 +422,25 @@ static void dissect_tado_general(tvbuff_t *tvb, packet_info *pinfo,
     if (packet_length > offset + 2) {
         guint payload_len = packet_length - offset - 2;
         if (ftype == IEEE802154_FTYPE_ACK) {
-            // Enhanced Ack: short cleartext MAC payload, not 6LoWPAN.
-            proto_tree_add_item(tado_tree, hf_tado_ack_payload, tvb, offset, payload_len, ENC_NA);
+            // Enhanced Ack (unencrypted): a CSL IE (Phase + Period) then a Header
+            // Termination IE, optionally followed by a short cleartext MAC payload.
+            guint end = offset + payload_len;
+            guint8 first_ie = (offset + 2 <= end)
+                ? (guint8)((tvb_get_letohs(tvb, offset) >> 7) & 0xff) : 0;
+            if (offset + 6 <= end && first_ie == IEEE802154_HIE_CSL) {
+                dissect_tado_header_ie(tvb, tado_tree, offset);
+                offset += 2;
+                proto_tree_add_item(tado_tree, hf_tado_csl_phase,  tvb, offset, 2, ENC_LITTLE_ENDIAN);
+                offset += 2;
+                proto_tree_add_item(tado_tree, hf_tado_csl_period, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+                offset += 2;
+                if (offset + 2 <= end) {   // Header Termination IE
+                    dissect_tado_header_ie(tvb, tado_tree, offset);
+                    offset += 2;
+                }
+            }
+            if (offset < end)
+                proto_tree_add_item(tado_tree, hf_tado_ack_payload, tvb, offset, end - offset, ENC_NA);
         } else {
             proto_tree_add_item(tado_tree, hf_tado_enc_payload, tvb, offset, payload_len, ENC_NA);
             if (tado_payload_is_6lowpan && sixlowpan_handle) {
@@ -470,12 +527,16 @@ void proto_register_tado(void)
         { &hf_tado_checksum,     { "Checksum",            "tado.checksum",     FT_UINT16,  BASE_HEX,  NULL, 0x0, "Frame checksum (CRC-16/CMS, replaces the 802.15.4 FCS)", HFILL }},
         { &hf_tado_crc_status,   { "Checksum Status",     "tado.crc_status",   FT_UINT8,   BASE_NONE, VALS(tado_checksum_vals), 0x0, NULL, HFILL }},
 
-        { &hf_tado_sync_sequence,{ "Sync Sequence",       "tado.sync.sequence",      FT_UINT8,  BASE_HEX, NULL, 0x0, "Constant within a polling session; changes between sessions", HFILL }},
-        { &hf_tado_sync_const,   { "SYNC Constant",       "tado.sync.const",         FT_UINT16, BASE_HEX, NULL, 0x0, "Constant in SYNC frames (observed 0xcdab); CSL/MP addressing field", HFILL }},
-        { &hf_tado_sync_target,  { "Target Device",       "tado.sync.target",        FT_UINT16, BASE_HEX, NULL, 0x0, "Device the beacon is polling; 0xffff = broadcast", HFILL }},
-        { &hf_tado_sync_const1,  { "SYNC Const 1",        "tado.sync.const1",        FT_UINT16, BASE_HEX, NULL, 0x0, "Constant in SYNC frames (observed 0x0e82)", HFILL }},
-        { &hf_tado_sync_countdown,{ "Poll Countdown",     "tado.sync.poll_countdown",FT_UINT16, BASE_DEC, NULL, 0x0, "CSL rendezvous time; decrements to 0 at the scheduled poll", HFILL }},
-        { &hf_tado_sync_const2,  { "SYNC Const 2",        "tado.sync.const2",        FT_UINT16, BASE_HEX, NULL, 0x0, "Constant in SYNC frames (observed 0x3f80)", HFILL }},
+        { &hf_tado_mpfc_dst_pan, { "Destination PAN ID",  "tado.mpfc.dst_pan",       FT_UINT16, BASE_HEX, NULL, 0x0, "Network PAN identifier (observed 0xABCD)", HFILL }},
+        { &hf_tado_mpfc_dst_addr,{ "Destination Address", "tado.mpfc.dst_addr",      FT_UINT16, BASE_HEX, NULL, 0x0, "16-bit short address of the device being woken; 0xffff = broadcast", HFILL }},
+        { &hf_tado_csl_rendezvous,{ "CSL Rendezvous Time","tado.csl.rendezvous",     FT_UINT16, BASE_DEC, NULL, 0x0, "802.15.4e CSL time-to-frame; decrements to 0 at the scheduled poll", HFILL }},
+        { &hf_tado_csl_phase,    { "CSL Phase",           "tado.csl.phase",          FT_UINT16, BASE_DEC, NULL, 0x0, "802.15.4e CSL Phase (Enhanced Ack CSL IE)", HFILL }},
+        { &hf_tado_csl_period,   { "CSL Period",          "tado.csl.period",         FT_UINT16, BASE_DEC, NULL, 0x0, "802.15.4e CSL Period (Enhanced Ack CSL IE; observed 3125)", HFILL }},
+
+        { &hf_tado_ie_desc,   { "Header IE",           "tado.ie",             FT_UINT16, BASE_HEX, NULL, 0x0,    "IEEE 802.15.4-2015 Header Information Element descriptor", HFILL }},
+        { &hf_tado_ie_length, { "Length",              "tado.ie.length",      FT_UINT16, BASE_DEC, NULL, 0x007f, NULL, HFILL }},
+        { &hf_tado_ie_elemid, { "Element ID",          "tado.ie.element_id",  FT_UINT16, BASE_HEX, VALS(ieee802154_hie_elemid_vals), 0x7f80, NULL, HFILL }},
+        { &hf_tado_ie_type,   { "Type",                "tado.ie.type",        FT_UINT16, BASE_DEC, NULL, 0x8000, "0 = Header IE", HFILL }},
 
         { &hf_tado_addr_src,  { "Source",             "tado.addr.src",        FT_BYTES,  BASE_NONE, NULL, 0x0, "Source address", HFILL }},
         { &hf_tado_addr_dst,  { "Destination",        "tado.addr.dst",        FT_BYTES,  BASE_NONE, NULL, 0x0, "Destination address", HFILL }},
@@ -500,7 +561,8 @@ void proto_register_tado(void)
         &ett_tado_fcf,
         &ett_tado_sec,
         &ett_tado_addr_src,
-        &ett_tado_addr_dst
+        &ett_tado_addr_dst,
+        &ett_tado_ie
     };
 
     proto_tado = proto_register_protocol(

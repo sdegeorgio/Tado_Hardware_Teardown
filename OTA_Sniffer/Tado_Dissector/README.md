@@ -117,7 +117,7 @@ To resolve Tado device IDs assigned during pairing to custom names for each devi
 | Device ID | 16-bit ID in hex (e.g. `0x0f42`). Read from the **Source Device** or **Destination Device** sub-field of any data frame. |
 | Name | Free-text label (e.g. `Internet Bridge`, `Lounge TRV`). |
 
-Names appear in the packet tree and in any `proto_item` label that shows an address, including the **Target Device** field of SYNC beacons.
+Names appear in the packet tree and in any `proto_item` label that shows an address, including the **Destination Address** field of SYNC beacons.
 
 The table is saved to the Wireshark profile directory as `tado_device_names` and loaded automatically on startup.
 
